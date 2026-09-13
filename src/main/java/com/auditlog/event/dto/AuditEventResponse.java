@@ -15,6 +15,7 @@ public record AuditEventResponse(
         String resourceId,
         JsonNode payload,
         Instant timestamp,
+        Long sequenceNumber,
         String previousHash,
         String eventHash
 ) {
@@ -35,6 +36,7 @@ public record AuditEventResponse(
                 event.getResourceId(),
                 payload,
                 event.getTimestamp(),
+                event.getSequenceNumber(),
                 event.getPreviousHash(),
                 event.getEventHash()
         );

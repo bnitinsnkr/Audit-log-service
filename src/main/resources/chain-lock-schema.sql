@@ -1,0 +1,3 @@
+CREATE TABLE IF NOT EXISTS audit_chain_lock (
+    id BIGINT PRIMARY KEY
+);

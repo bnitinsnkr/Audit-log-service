@@ -35,10 +35,13 @@ public class AuditEvent {
     @Column(nullable = false)
     private Instant timestamp;
 
-    @Column
+    @Column(nullable = false, unique = true)
+    private Long sequenceNumber;
+
+    @Column(nullable = false)
     private String previousHash;
 
-    @Column
+    @Column(nullable = false)
     private String eventHash;
 
     public Long getId() {
@@ -95,6 +98,14 @@ public class AuditEvent {
 
     public void setTimestamp(Instant timestamp) {
         this.timestamp = timestamp;
+    }
+
+    public Long getSequenceNumber() {
+        return sequenceNumber;
+    }
+
+    public void setSequenceNumber(Long sequenceNumber) {
+        this.sequenceNumber = sequenceNumber;
     }
 
     public String getPreviousHash() {
