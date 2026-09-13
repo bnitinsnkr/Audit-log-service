@@ -78,6 +78,16 @@ class AuditEventHasherTest {
         assertThat(hashA).isNotEqualTo(hashB);
     }
 
+    @Test
+    void sha256HexOfCanonicalJsonMatchesManualSha256OfCanonicalForm() throws Exception {
+        JsonNode node = objectMapper.readTree("{\"b\":1,\"a\":2}");
+
+        String actual = hasher.sha256HexOfCanonicalJson(node);
+
+        String expected = sha256Hex(hasher.canonicalize(node));
+        assertThat(actual).isEqualTo(expected).hasSize(64).matches("[0-9a-f]{64}");
+    }
+
     private static String sha256Hex(String input) throws NoSuchAlgorithmException {
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));

@@ -44,6 +44,17 @@ public class AuditEvent {
     @Column(nullable = false)
     private String eventHash;
 
+    /**
+     * Lifecycle metadata for Scenario B soft-archive retention. Deliberately NOT part of
+     * {@link AuditEventHasher#computeEventHash}'s input - archiving must never change an
+     * event's eventHash.
+     */
+    @Column(nullable = false)
+    private boolean archived = false;
+
+    @Column
+    private Instant archivedAt;
+
     public Long getId() {
         return id;
     }
@@ -122,5 +133,21 @@ public class AuditEvent {
 
     public void setEventHash(String eventHash) {
         this.eventHash = eventHash;
+    }
+
+    public boolean isArchived() {
+        return archived;
+    }
+
+    public void setArchived(boolean archived) {
+        this.archived = archived;
+    }
+
+    public Instant getArchivedAt() {
+        return archivedAt;
+    }
+
+    public void setArchivedAt(Instant archivedAt) {
+        this.archivedAt = archivedAt;
     }
 }

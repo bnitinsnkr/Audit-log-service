@@ -169,6 +169,155 @@ class ChainVerificationServiceTest {
         assertThat(result.violationType()).isEqualTo(ChainViolationType.MALFORMED_PAYLOAD);
     }
 
+    @Test
+    void redactedEventWithMatchingProofIsValid() throws Exception {
+        AuditEvent original = validEvent(1L, AuditEventHasher.GENESIS_HASH, "{\"ssn\":\"123-45-6789\"}");
+        String originalHash = original.getEventHash();
+        // Simulate AuditRedactionService: only the payload column changes, hash fields untouched.
+        original.setPayload("{\"ssn\":\"***REDACTED***\"}");
+
+        JsonNode redactedPayload = objectMapper.readTree("{\"ssn\":\"***REDACTED***\"}");
+        String redactedPayloadHash = auditEventHasher.sha256HexOfCanonicalJson(redactedPayload);
+        AuditEvent proof = proofEvent(2L, originalHash, 1L, originalHash, redactedPayloadHash);
+
+        when(auditEventRepository.findAllByOrderBySequenceNumberAsc())
+                .thenReturn(List.of(original, proof));
+
+        ChainVerificationResponse result = service().verifyChain();
+
+        assertThat(result.valid()).isTrue();
+        assertThat(result.firstInconsistentRecord()).isNull();
+        assertThat(result.violationType()).isNull();
+    }
+
+    @Test
+    void redactedEventWithoutProofIsStillDetected() throws Exception {
+        AuditEvent original = validEvent(1L, AuditEventHasher.GENESIS_HASH, "{\"ssn\":\"123-45-6789\"}");
+        original.setPayload("{\"ssn\":\"***REDACTED***\"}");
+        when(auditEventRepository.findAllByOrderBySequenceNumberAsc()).thenReturn(List.of(original));
+
+        ChainVerificationResponse result = service().verifyChain();
+
+        assertThat(result.valid()).isFalse();
+        assertThat(result.firstInconsistentRecord()).isEqualTo(1L);
+        assertThat(result.violationType()).isEqualTo(ChainViolationType.EVENT_HASH_MISMATCH);
+    }
+
+    @Test
+    void modifyingRedactedPayloadAfterProofIsDetected() throws Exception {
+        AuditEvent original = validEvent(1L, AuditEventHasher.GENESIS_HASH, "{\"ssn\":\"123-45-6789\"}");
+        String originalHash = original.getEventHash();
+        original.setPayload("{\"ssn\":\"***REDACTED***\"}");
+
+        JsonNode redactedPayload = objectMapper.readTree("{\"ssn\":\"***REDACTED***\"}");
+        String redactedPayloadHash = auditEventHasher.sha256HexOfCanonicalJson(redactedPayload);
+        AuditEvent proof = proofEvent(2L, originalHash, 1L, originalHash, redactedPayloadHash);
+
+        // After the proof was written, someone edits the already-redacted payload again.
+        original.setPayload("{\"ssn\":\"something-else\"}");
+
+        when(auditEventRepository.findAllByOrderBySequenceNumberAsc())
+                .thenReturn(List.of(original, proof));
+
+        ChainVerificationResponse result = service().verifyChain();
+
+        assertThat(result.valid()).isFalse();
+        assertThat(result.firstInconsistentRecord()).isEqualTo(1L);
+        assertThat(result.violationType()).isEqualTo(ChainViolationType.EVENT_HASH_MISMATCH);
+    }
+
+    @Test
+    void tamperedProofEventIsDetected() throws Exception {
+        AuditEvent original = validEvent(1L, AuditEventHasher.GENESIS_HASH, "{\"ssn\":\"123-45-6789\"}");
+        String originalHash = original.getEventHash();
+        original.setPayload("{\"ssn\":\"***REDACTED***\"}");
+
+        JsonNode redactedPayload = objectMapper.readTree("{\"ssn\":\"***REDACTED***\"}");
+        String redactedPayloadHash = auditEventHasher.sha256HexOfCanonicalJson(redactedPayload);
+        AuditEvent proof = proofEvent(2L, originalHash, 1L, originalHash, redactedPayloadHash);
+        // Tamper the proof event's own payload after the fact, leaving its stored hash as-is.
+        var tamperedPayload = (com.fasterxml.jackson.databind.node.ObjectNode) objectMapper.readTree(proof.getPayload());
+        tamperedPayload.put("reason", "tampered-reason");
+        proof.setPayload(objectMapper.writeValueAsString(tamperedPayload));
+
+        when(auditEventRepository.findAllByOrderBySequenceNumberAsc())
+                .thenReturn(List.of(original, proof));
+
+        ChainVerificationResponse result = service().verifyChain();
+
+        assertThat(result.valid()).isFalse();
+        // The proof's own tamper is detected regardless of which sequenceNumber is reported first;
+        // either way the chain must no longer report valid=true.
+        assertThat(result.violationType()).isEqualTo(ChainViolationType.EVENT_HASH_MISMATCH);
+    }
+
+    @Test
+    void proofCannotAuthorizeATargetThatComesAfterTheProofItself() throws Exception {
+        AuditEvent event1 = validEvent(1L, AuditEventHasher.GENESIS_HASH, "{\"a\":1}");
+
+        // A forged scenario (only reachable via direct data-store manipulation, exactly the
+        // threat model this system defends against): a well-formed, self-consistent
+        // AUDIT_PAYLOAD_REDACTED event at sequence 2 claims to redact sequence 3 - an event that
+        // comes AFTER it. Every other field of the claim is made to match on purpose, isolating
+        // the ordering rule as the only thing that can catch this.
+        String claimedOriginalHashForEvent3 = "c".repeat(64);
+        JsonNode event3Payload = objectMapper.readTree("{\"ssn\":\"123-45-6789\"}");
+        String claimedRedactedPayloadHash = auditEventHasher.sha256HexOfCanonicalJson(event3Payload);
+
+        AuditEvent event2 = proofEvent(2L, event1.getEventHash(), 3L, claimedOriginalHashForEvent3,
+                claimedRedactedPayloadHash);
+
+        AuditEvent event3 = new AuditEvent();
+        event3.setId(3L);
+        event3.setSequenceNumber(3L);
+        event3.setPreviousHash(event2.getEventHash());
+        event3.setEventHash(claimedOriginalHashForEvent3);
+        event3.setEventType("USER_LOGIN");
+        event3.setActorId("actor-1");
+        event3.setResourceType("ACCOUNT");
+        event3.setResourceId("resource-1");
+        event3.setPayload(objectMapper.writeValueAsString(event3Payload));
+        event3.setTimestamp(Instant.ofEpochMilli(BASE_TIMESTAMP + 3));
+
+        when(auditEventRepository.findAllByOrderBySequenceNumberAsc())
+                .thenReturn(List.of(event1, event2, event3));
+
+        ChainVerificationResponse result = service().verifyChain();
+
+        assertThat(result.valid()).isFalse();
+        assertThat(result.firstInconsistentRecord()).isEqualTo(3L);
+        assertThat(result.violationType()).isEqualTo(ChainViolationType.EVENT_HASH_MISMATCH);
+    }
+
+    private AuditEvent proofEvent(long sequenceNumber, String previousHash, long targetSequenceNumber,
+            String targetEventHash, String redactedPayloadHash) throws Exception {
+        var payload = objectMapper.createObjectNode();
+        payload.put("targetSequenceNumber", targetSequenceNumber);
+        payload.put("targetEventHash", targetEventHash);
+        payload.put("redactedPayloadHash", redactedPayloadHash);
+        payload.putArray("paths");
+        payload.put("reason", "test");
+        payload.put("redactedAt", Instant.ofEpochMilli(BASE_TIMESTAMP).toString());
+
+        long timestamp = BASE_TIMESTAMP + sequenceNumber;
+        String eventHash = auditEventHasher.computeEventHash(previousHash, sequenceNumber,
+                AuditRedactionService.REDACTION_PROOF_EVENT_TYPE, "privacy-officer-1", "ACCOUNT", "resource-1",
+                payload, timestamp);
+
+        AuditEvent event = new AuditEvent();
+        event.setId(sequenceNumber);
+        event.setSequenceNumber(sequenceNumber);
+        event.setPreviousHash(previousHash);
+        event.setEventHash(eventHash);
+        event.setEventType(AuditRedactionService.REDACTION_PROOF_EVENT_TYPE);
+        event.setActorId("privacy-officer-1");
+        event.setResourceType("ACCOUNT");
+        event.setResourceId("resource-1");
+        event.setPayload(objectMapper.writeValueAsString(payload));
+        event.setTimestamp(Instant.ofEpochMilli(timestamp));
+        return event;
+    }
+
     private AuditEvent validEvent(long sequenceNumber, String previousHash, String payloadJson) throws Exception {
         JsonNode payload = objectMapper.readTree(payloadJson);
         long timestamp = BASE_TIMESTAMP + sequenceNumber;

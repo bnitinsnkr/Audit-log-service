@@ -57,6 +57,16 @@ public class AuditEventHasher {
         }
     }
 
+    /**
+     * SHA-256 hex digest of a node's canonical JSON form (same canonicalization and hashing
+     * rules as {@link #computeEventHash}, exposed for Scenario B's redacted-payload-hash and
+     * export-bundle-hash needs). Does not participate in {@link #computeEventHash} itself and
+     * does not change its behavior.
+     */
+    public String sha256HexOfCanonicalJson(JsonNode node) {
+        return sha256Hex(canonicalize(node));
+    }
+
     private JsonNode sortKeysRecursively(JsonNode node) {
         if (node.isObject()) {
             Map<String, JsonNode> sortedFields = new TreeMap<>();
