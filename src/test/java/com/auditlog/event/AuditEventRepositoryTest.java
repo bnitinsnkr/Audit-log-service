@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -55,6 +56,20 @@ class AuditEventRepositoryTest {
         assertThat(top).isPresent();
         assertThat(top.get().getSequenceNumber()).isEqualTo(3L);
         assertThat(top.get().getEventHash()).isEqualTo("hash-3");
+    }
+
+    @Test
+    void findAllByOrderBySequenceNumberAscReturnsEventsInAscendingOrder() {
+        auditEventRepository.save(newEvent(3L, "hash-3"));
+        auditEventRepository.save(newEvent(1L, "hash-1"));
+        auditEventRepository.save(newEvent(2L, "hash-2"));
+
+        List<AuditEvent> events = auditEventRepository.findAllByOrderBySequenceNumberAsc();
+
+        assertThat(events).hasSize(3);
+        assertThat(events.get(0).getSequenceNumber()).isEqualTo(1L);
+        assertThat(events.get(1).getSequenceNumber()).isEqualTo(2L);
+        assertThat(events.get(2).getSequenceNumber()).isEqualTo(3L);
     }
 
     private static AuditEvent newEvent(long sequenceNumber, String eventHash) {
