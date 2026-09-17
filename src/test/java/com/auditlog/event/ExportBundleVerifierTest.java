@@ -1,5 +1,7 @@
 package com.auditlog.event;
 
+import com.auditlog.event.dto.ComplianceReportFilters;
+import com.auditlog.event.dto.ComplianceReportResponse;
 import com.auditlog.event.dto.ExportBundleResponse;
 import com.auditlog.event.dto.ExportFilter;
 import com.auditlog.event.dto.ExportRecord;
@@ -178,5 +180,69 @@ class ExportBundleVerifierTest {
                 exportedAt, filter, "SHA-256", List.of(redacted), List.of(), bundleHash);
 
         assertThat(verifier.isValid(bundle)).isFalse();
+    }
+
+    @Test
+    void computeBundleHashForComplianceReportFiltersIsDeterministic() throws Exception {
+        ComplianceReportFilters filters = new ComplianceReportFilters(
+                "actor-1", "ACCOUNT", "resource-1", "USER_LOGIN",
+                Instant.parse("2026-01-01T00:00:00Z"), Instant.parse("2026-01-31T00:00:00Z"));
+        List<ExportRecord> records = List.of(sampleRecord(1));
+        Instant generatedAt = Instant.parse("2026-01-02T00:00:00Z");
+
+        String hash1 = verifier.computeBundleHash(generatedAt, filters, "SHA-256", records, List.of());
+        String hash2 = verifier.computeBundleHash(generatedAt, filters, "SHA-256", records, List.of());
+
+        assertThat(hash1).isEqualTo(hash2).hasSize(64).matches("[0-9a-f]{64}");
+    }
+
+    @Test
+    void validComplianceReportVerifies() throws Exception {
+        ComplianceReportFilters filters = new ComplianceReportFilters(
+                "actor-1", null, null, null, null, null);
+        List<ExportRecord> records = List.of(sampleRecord(1));
+        Instant generatedAt = Instant.parse("2026-01-02T00:00:00Z");
+        String bundleHash = verifier.computeBundleHash(generatedAt, filters, "SHA-256", records, List.of());
+
+        ComplianceReportResponse report =
+                new ComplianceReportResponse(generatedAt, filters, "SHA-256", records, List.of(), bundleHash);
+
+        assertThat(verifier.isValid(report)).isTrue();
+    }
+
+    @Test
+    void mutatingAComplianceReportRecordAfterGenerationIsDetected() throws Exception {
+        ComplianceReportFilters filters = new ComplianceReportFilters(
+                "actor-1", null, null, null, null, null);
+        List<ExportRecord> records = List.of(sampleRecord(1));
+        Instant generatedAt = Instant.parse("2026-01-02T00:00:00Z");
+        String bundleHash = verifier.computeBundleHash(generatedAt, filters, "SHA-256", records, List.of());
+
+        // Different payload, but the OLD (now stale) bundleHash and eventHash are kept -
+        // simulates someone editing the report JSON after it was generated.
+        ExportRecord original = records.get(0);
+        List<ExportRecord> tamperedRecords = List.of(new ExportRecord(1L, "USER_LOGIN", "actor-1", "ACCOUNT",
+                "resource-1", objectMapper.readTree("{\"ip\":\"9.9.9.9\"}"), original.timestamp(),
+                original.previousHash(), original.eventHash(), false, null));
+        ComplianceReportResponse tamperedReport = new ComplianceReportResponse(
+                generatedAt, filters, "SHA-256", tamperedRecords, List.of(), bundleHash);
+
+        assertThat(verifier.isValid(tamperedReport)).isFalse();
+    }
+
+    @Test
+    void mutatingComplianceReportFilterMetadataAfterGenerationIsDetected() throws Exception {
+        ComplianceReportFilters filters = new ComplianceReportFilters(
+                "actor-1", null, null, null, null, null);
+        List<ExportRecord> records = List.of(sampleRecord(1));
+        Instant generatedAt = Instant.parse("2026-01-02T00:00:00Z");
+        String bundleHash = verifier.computeBundleHash(generatedAt, filters, "SHA-256", records, List.of());
+
+        ComplianceReportFilters tamperedFilters = new ComplianceReportFilters(
+                "someone-else", null, null, null, null, null);
+        ComplianceReportResponse tamperedReport = new ComplianceReportResponse(
+                generatedAt, tamperedFilters, "SHA-256", records, List.of(), bundleHash);
+
+        assertThat(verifier.isValid(tamperedReport)).isFalse();
     }
 }

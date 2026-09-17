@@ -1,5 +1,7 @@
 package com.auditlog.event;
 
+import com.auditlog.event.dto.ComplianceReportFilters;
+import com.auditlog.event.dto.ComplianceReportResponse;
 import com.auditlog.event.dto.ExportBundleResponse;
 import com.auditlog.event.dto.ExportFilter;
 import com.auditlog.event.dto.ExportRecord;
@@ -70,7 +72,38 @@ public class ExportBundleVerifier {
     }
 
     public boolean isValid(ExportBundleResponse bundle) {
-        return bundleHashMatches(bundle) && everyRecordAndProofIsIndividuallyValid(bundle);
+        return bundleHashMatches(bundle) && everyRecordAndProofIsIndividuallyValid(
+                bundle.records(), bundle.redactionProofs());
+    }
+
+    /**
+     * Same two checks as {@link #isValid(ExportBundleResponse)}, for a Scenario C compliance
+     * report instead of a Scenario B export bundle. A verifiable report is this project's design
+     * choice for satisfying the regulatory-audit requirement; reusing this class (rather than a
+     * parallel verifier) means both share exactly one canonicalization/hashing/reconciliation
+     * authority.
+     */
+    public boolean isValid(ComplianceReportResponse report) {
+        return bundleHashMatches(report) && everyRecordAndProofIsIndividuallyValid(
+                report.records(), report.redactionProofs());
+    }
+
+    /**
+     * Compliance-report counterpart to {@link #computeBundleHash(Instant, ExportFilter, String,
+     * List, List)}: same canonicalization, but binding {@link ComplianceReportFilters}'s six
+     * named fields instead of a single {@link ExportFilter} type/value pair, since a compliance
+     * report can combine several filters at once.
+     */
+    public String computeBundleHash(Instant generatedAt, ComplianceReportFilters filters, String hashAlgorithm,
+            List<ExportRecord> records, List<ExportRecord> redactionProofs) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("generatedAt", generatedAt.toString());
+        node.set("filters", objectMapper.valueToTree(filters));
+        node.put("hashAlgorithm", hashAlgorithm);
+        node.set("records", objectMapper.valueToTree(records));
+        node.set("redactionProofs", objectMapper.valueToTree(redactionProofs));
+
+        return auditEventHasher.sha256HexOfCanonicalJson(node);
     }
 
     private boolean bundleHashMatches(ExportBundleResponse bundle) {
@@ -79,15 +112,22 @@ public class ExportBundleVerifier {
         return recomputed.equals(bundle.bundleHash());
     }
 
-    private boolean everyRecordAndProofIsIndividuallyValid(ExportBundleResponse bundle) {
+    private boolean bundleHashMatches(ComplianceReportResponse report) {
+        String recomputed = computeBundleHash(report.generatedAt(), report.filters(), report.hashAlgorithm(),
+                report.records(), report.redactionProofs());
+        return recomputed.equals(report.bundleHash());
+    }
+
+    private boolean everyRecordAndProofIsIndividuallyValid(
+            List<ExportRecord> records, List<ExportRecord> redactionProofs) {
         // A proof event can independently satisfy the export filter too (e.g. it happens to
         // share the exported resourceId), so it may appear in both lists; de-duplicate by
         // sequenceNumber so it is only checked once.
         Map<Long, ExportRecord> bySequenceNumber = new LinkedHashMap<>();
-        for (ExportRecord record : bundle.records()) {
+        for (ExportRecord record : records) {
             bySequenceNumber.putIfAbsent(record.sequenceNumber(), record);
         }
-        for (ExportRecord proof : bundle.redactionProofs()) {
+        for (ExportRecord proof : redactionProofs) {
             bySequenceNumber.putIfAbsent(proof.sequenceNumber(), proof);
         }
 
