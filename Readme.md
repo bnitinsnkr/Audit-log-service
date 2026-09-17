@@ -1,83 +1,634 @@
-Audit Log Service
+# Audit Log Service
 
-Overview
+A Spring Boot prototype for a tamper-evident, append-only audit log service. The project implements all three assignment scenarios:
 
-This project is an Audit Log Service built with Java 17, Spring Boot, Spring Data JPA, PostgreSQL, H2, Maven, Jackson, JUnit 5, Mockito, and MockMvc.
+- **Scenario A — Core Audit Log Service**
+- **Scenario B — Retention, Structured Redaction, and Verifiable Export**
+- **Scenario C — Compliance Reporting**
 
-The service is designed to create an audit trail that can be queried and independently checked for unexpected modification. Scenario A establishes the append-only, tamper-evident audit chain. Scenario B extends that foundation with compliance-oriented lifecycle capabilities: retention, structured redaction, and verifiable export.
+The service records audit events, protects history with a SHA-256 hash chain, supports filtered queries and integrity verification, preserves auditability across retention and privacy operations, produces independently verifiable export/report bundles, and demonstrates a requirements-first approach for an intentionally ambiguous compliance requirement.
 
-The guiding principle throughout the project is to keep the implementation small, testable, and explainable.
+---
 
-High-Level Architecture
+## 1. Technology Stack
 
-Controller
-   ↓
-Service
-   ↓
-Repository
-   ↓
-Database
+- Java 17
+- Spring Boot
+- Spring Web
+- Spring Data JPA
+- Jakarta Validation
+- PostgreSQL for the application database
+- H2 for automated tests
+- Maven / Maven Wrapper
+- JUnit 5
+- MockMvc
+- Jackson
 
-Audit writes additionally use a database-backed concurrency lock:
+No frontend application is required for this prototype.
 
-POST /audit/events
-   ↓
+---
+
+## 2. Architecture
+
+The application uses a conventional layered Spring Boot design:
+
+```text
+Client / Postman
+      |
+      v
+REST Controller
+      |
+      v
+Request DTO / Query Parameters
+      |
+      v
+Service Layer
+      |
+      +--> Hash / verification / retention / redaction / export logic
+      |
+      v
+Spring Data JPA Repository
+      |
+      v
+PostgreSQL
+```
+
+Important components include:
+
+```text
+AuditEventController
 AuditEventService
-   ↓
-Acquire singleton ChainLock
-   ↓
-Read current chain tail
-   ↓
-Assign next sequenceNumber
-   ↓
-Calculate previousHash
-   ↓
-Calculate eventHash
-   ↓
-Persist event
-   ↓
-Commit transaction
+AuditEventQueryService
+AuditEventRepository
+AuditEventSpecifications
 
-Scenario A — Tamper-Evident Audit Logging
+AuditEventHasher
+ChainVerificationService
+ChainLock
+ChainLockRepository
+ChainLockStartupVerifier
 
-Scenario A establishes the core audit trail.
+AuditRetentionController
+AuditRetentionService
 
-It includes:
+AuditRedactionController
+AuditRedactionService
 
-Append-only event creation
+AuditExportController
+AuditExportService
+ExportBundleVerifier
 
-SHA-256 hash chaining
+AuditComplianceReportController
+AuditComplianceReportService
+```
 
-Safe concurrent writes
+The core persisted entity is `AuditEvent`.
 
-Query/filter support with pagination
+---
 
-Chain verification
+# Scenario A — Core Audit Log Service
 
-Tamper detection
+## 3. Write API
 
-1. Creating Audit Events
+### Endpoint
 
-Endpoint
-
+```http
 POST /audit/events
+```
 
-Example:
+The client sends an event containing:
 
+```json
 {
   "eventType": "ACCOUNT_VIEWED",
   "actorId": "user-123",
   "resourceType": "ACCOUNT",
   "resourceId": "account-456",
   "payload": {
-    "ip": "127.0.0.1"
+    "channel": "WEB",
+    "detail": "example"
   }
 }
+```
 
-The timestamp is assigned by the server.
+The authoritative timestamp is **server-assigned**.
 
-Each persisted event contains:
+The incoming JSON is converted by Spring/Jackson into `CreateAuditEventRequest`, validated, and passed to `AuditEventService.recordEvent(...)`.
 
+The service then:
+
+1. acquires the singleton chain lock;
+2. creates a server timestamp;
+3. loads the current chain tail;
+4. derives the next `sequenceNumber`;
+5. determines `previousHash`;
+6. computes the new `eventHash`;
+7. builds an `AuditEvent`;
+8. persists it through `AuditEventRepository.save(...)`.
+
+A successful create returns:
+
+```http
+201 Created
+```
+
+The response uses `AuditEventResponse` and includes the persisted event plus integrity metadata such as `sequenceNumber`, `previousHash`, and `eventHash`.
+
+---
+
+## 4. Append-Only Model
+
+The public API exposes no normal update or delete endpoint for historical audit events.
+
+New activity is appended as a new row:
+
+```text
+Event 1
+   |
+   v
+Event 2
+   |
+   v
+Event 3
+   |
+   v
+Event 4
+```
+
+Direct database access is outside the append-only API boundary. If historical rows are changed directly in the datastore, chain verification is designed to detect the inconsistency.
+
+---
+
+## 5. Hash Chain Design
+
+Each event stores:
+
+- `sequenceNumber`
+- `previousHash`
+- `eventHash`
+
+The first event uses a defined genesis hash. Every later event references the immediately preceding event hash.
+
+Conceptually:
+
+```text
+GENESIS
+   |
+   v
+Event 1 hash
+   |
+   v
+Event 2 hash
+   |
+   v
+Event 3 hash
+```
+
+The event hash is calculated with SHA-256 over a deterministic representation of the protected event content and chain metadata.
+
+Canonical JSON handling is used so logically equivalent structured payloads produce deterministic hash input.
+
+### Why the chain lock exists
+
+Two concurrent requests must not both read the same chain tail and create competing "next" events.
+
+The application therefore serializes chain appends through a singleton `ChainLock` row. This avoids relying on database auto-increment IDs as the integrity ordering mechanism.
+
+---
+
+## 6. Query API
+
+### Endpoint
+
+```http
+GET /audit/events
+```
+
+Supported optional filters include:
+
+- `actorId`
+- `resourceType`
+- `resourceId`
+- `eventType`
+- `from`
+- `to`
+- `includeArchived`
+
+Pagination is supported.
+
+Example:
+
+```http
+GET /audit/events?actorId=user-123&eventType=ACCOUNT_VIEWED
+```
+
+Example including archived records:
+
+```http
+GET /audit/events?includeArchived=true
+```
+
+Normal browsing excludes archived records by default. Archived records remain available when explicitly requested and remain available to integrity/compliance features.
+
+---
+
+## 7. Chain Verification
+
+### Endpoint
+
+```http
+GET /audit/verify
+```
+
+Verification walks the chain in sequence order and checks the integrity rules for every record.
+
+It reports whether the chain is valid. If invalid, it identifies the first detected inconsistency and violation type.
+
+The verifier checks conditions including:
+
+- correct genesis linkage;
+- continuous sequence numbering;
+- valid `previousHash` linkage;
+- valid stored event hash;
+- parseable persisted payload;
+- legitimate structured-redaction proof handling.
+
+Typical demonstration:
+
+```text
+Create events
+    |
+    v
+GET /audit/verify
+    |
+    v
+valid = true
+
+Directly modify historical database data
+    |
+    v
+GET /audit/verify
+    |
+    v
+tampering detected
+```
+
+---
+
+# Scenario B — Retention, Redaction, and Export
+
+Scenario B extends the Scenario A chain without replacing its integrity model.
+
+---
+
+## 8. Retention / Soft Archive
+
+Old audit records are not physically deleted by the retention implementation. Instead, eligible rows are marked as archived.
+
+Additional lifecycle metadata:
+
+```text
+archived
+archivedAt
+```
+
+These fields are intentionally not part of the original Scenario A event hash input. Archiving is a legitimate lifecycle operation and must not make an otherwise valid historical event appear maliciously modified.
+
+### Configuration
+
+The retention window is configurable through:
+
+```properties
+audit.retention.days
+```
+
+### Endpoint
+
+```http
+POST /audit/retention/archive
+```
+
+The retention service:
+
+1. calculates a cutoff from the configured retention period;
+2. finds non-archived events older than that cutoff;
+3. sets `archived = true`;
+4. sets `archivedAt`;
+5. persists the lifecycle change;
+6. returns the number of archived records and cutoff information.
+
+Important guarantees:
+
+- archived rows remain physically present;
+- original sequence/hash fields are unchanged;
+- already-archived rows are not reprocessed;
+- `GET /audit/verify` remains valid after legitimate archival;
+- normal query browsing hides archived rows by default;
+- compliance/export operations can still include archived history.
+
+---
+
+## 9. Structured Redaction
+
+Sensitive data may exist inside an event payload. Examples include account identifiers or other personal/business-sensitive values.
+
+Simply editing a hashed payload would normally break the Scenario A hash.
+
+The implemented approach allows selected JSON fields to be redacted while preserving evidence that the change was an authorized privacy operation.
+
+### Endpoint
+
+```http
+POST /audit/events/{sequenceNumber}/redact
+```
+
+The redaction flow:
+
+1. loads the target audit event;
+2. validates the requested JSON paths;
+3. prevents invalid/root-only paths and disallows redacting a redaction-proof event itself;
+4. applies the approved redaction atomically;
+5. leaves unrelated payload fields unchanged;
+6. leaves the target event's original chain metadata unchanged;
+7. appends a dedicated redaction-proof audit event to the chain;
+8. allows chain verification to reconcile the redacted target against its proof.
+
+The proof event is itself part of the append-only chain.
+
+The verifier distinguishes authorized redaction from unexplained payload modification.
+
+Tests cover nested and top-level field redaction, direct payload tampering without proof, modification of an already-redacted payload, proof-event tampering, missing targets, invalid paths, and atomic rollback.
+
+### Trade-off
+
+This design preserves auditability after privacy-driven field removal, but it does not provide an external trust anchor by itself. An attacker with unrestricted database access who can rewrite the entire chain and recompute all hashes is outside the guarantee of a plain unkeyed hash chain.
+
+A production design could add digital signatures, HMACs using protected key material, immutable/WORM storage, or external checkpoints.
+
+---
+
+## 10. Bulk Export
+
+### Endpoint
+
+```http
+GET /audit/export
+```
+
+Exactly one of the following filters is supplied:
+
+```text
+actorId
+resourceId
+```
+
+Examples:
+
+```http
+GET /audit/export?actorId=user-123
+```
+
+```http
+GET /audit/export?resourceId=account-456
+```
+
+The export includes matching audit records in ascending sequence order and includes relevant redaction proof events when necessary.
+
+Archived records are included.
+
+The response is a self-contained verifiable bundle containing integrity metadata such as:
+
+```text
+export metadata
+filter metadata
+hash algorithm
+records
+redaction proofs
+bundleHash
+```
+
+`ExportBundleVerifier` independently verifies the bundle.
+
+Integrity checks cover deterministic bundle hashing, individual event integrity, redaction proof reconciliation, and after-the-fact modification of record, payload, filter metadata, or proof data.
+
+A structurally valid bundle is also produced when a valid filter matches zero records.
+
+---
+
+# Scenario C — Compliance Reporting
+
+## 11. Original Product Requirement
+
+The product requirement was intentionally ambiguous:
+
+> Regulators need to be able to audit access to client account data.
+
+The implementation was intentionally preceded by requirement clarification rather than immediately hardcoding a new event type or regulator workflow.
+
+---
+
+## 12. Ambiguities Identified
+
+Key questions included:
+
+- What counts as "access"?
+- Are failed or denied attempts access events?
+- Which actors are in scope: humans, service accounts, jobs, integrations?
+- What qualifies as "client account data"?
+- Does a regulator call the API directly, or does internal compliance generate a report?
+- Which fields are required as evidence?
+- Is purpose/reason-for-access required?
+- What time period must be reportable?
+- What retention applies?
+- Is a downloadable export required?
+- Who is authorized to generate reports?
+- What privacy/redaction rules apply to the report?
+
+---
+
+## 13. Scenario C Assumptions
+
+For this prototype:
+
+1. **Upstream systems define what "access" means.** This audit service does not classify arbitrary business activity into "access" categories.
+2. `eventType` remains an arbitrary audit-event value and can be used as a report filter.
+3. Human and non-human actors can both be represented by `actorId`.
+4. Existing `resourceType` / `resourceId` values define the audited resource.
+5. Archived history must be included in compliance reporting.
+6. Legitimately redacted data must remain redacted; reports may include associated redaction proofs.
+7. The generated report is read-only and is not persisted as a new audit record.
+8. Authentication/authorization is not implemented in this prototype and is a production blocker.
+9. Returning a self-contained verifiable report is a project design choice; the ambiguous product statement did not explicitly mandate a downloadable export format.
+
+---
+
+## 14. Normalized Scenario C Requirement
+
+Provide a read-only compliance-report endpoint over the existing audit history that can combine the available audit filters, always includes archived history, respects legitimate redaction, and returns enough integrity metadata to verify the generated report independently.
+
+The reporting feature must not mutate the underlying audit chain.
+
+---
+
+## 15. Compliance Report API
+
+### Endpoint
+
+```http
+GET /api/v1/compliance-report
+```
+
+Exactly six optional filters are supported:
+
+- `actorId`
+- `resourceType`
+- `resourceId`
+- `eventType`
+- `from`
+- `to`
+
+Any combination is allowed.
+
+Example:
+
+```http
+GET /api/v1/compliance-report?actorId=user-123&eventType=ACCOUNT_VIEWED&from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z
+```
+
+Calling the endpoint with no filters is also valid and returns the complete reportable history.
+
+### Time validation
+
+If both `from` and `to` are provided and `from > to`, the endpoint returns:
+
+```http
+400 Bad Request
+```
+
+The following are valid:
+
+```text
+from == to
+only from supplied
+only to supplied
+```
+
+Malformed timestamps are rejected with `400 Bad Request` by Spring's request-parameter conversion handling.
+
+### Archived records
+
+There is intentionally no `includeArchived` query parameter.
+
+`AuditComplianceReportService` forces archived records to be included so a caller cannot accidentally generate an incomplete compliance history by omitting archived events.
+
+### Response
+
+The report is read-only and self-contained.
+
+Representative shape:
+
+```json
+{
+  "generatedAt": "2026-09-17T09:00:00Z",
+  "filters": {
+    "actorId": "user-123",
+    "resourceType": null,
+    "resourceId": null,
+    "eventType": "ACCOUNT_VIEWED",
+    "from": "2026-01-01T00:00:00Z",
+    "to": "2026-02-01T00:00:00Z"
+  },
+  "hashAlgorithm": "SHA-256",
+  "records": [],
+  "redactionProofs": [],
+  "bundleHash": "..."
+}
+```
+
+If a matching event has been legitimately redacted, the report contains the currently redacted payload plus the relevant proof; it does not re-expose the original sensitive value.
+
+The report uses the same integrity principles as Scenario B export and is verified by the compliance-report overloads in `ExportBundleVerifier`.
+
+---
+
+## 16. Scenario C Design
+
+The Scenario C implementation intentionally reuses existing components instead of building a second audit subsystem.
+
+```text
+GET /api/v1/compliance-report
+          |
+          v
+AuditComplianceReportController
+          |
+          v
+ComplianceReportFilters
+          |
+          v
+AuditComplianceReportService
+          |
+          +--> AuditEventSpecifications
+          +--> AuditEventRepository
+          +--> existing redaction proof logic
+          +--> ExportRecord
+          +--> ExportBundleVerifier
+          |
+          v
+ComplianceReportResponse
+```
+
+This keeps one source of truth for filtering, event integrity, redaction reconciliation, and canonical bundle hashing.
+
+No new persistence table or schema is required for Scenario C.
+
+---
+
+## 17. Scenario C Scope Boundary
+
+Implemented:
+
+- read-only compliance-report endpoint;
+- six combinable filters;
+- complete history including archived records;
+- redaction-aware report generation;
+- independently verifiable report bundle;
+- deterministic bundle hash;
+- `from` / `to` ordering validation;
+- integration and service tests.
+
+Explicitly out of scope:
+
+- regulator-facing UI;
+- authentication / authorization / RBAC;
+- external IAM / SSO integration;
+- scheduling or recurring report delivery;
+- email/SFTP regulator delivery;
+- persistent storage of generated report artifacts;
+- automatic classification of business events into an "access" taxonomy;
+- integration with real client account systems.
+
+---
+
+# 18. API Summary
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| POST | `/audit/events` | Append a new audit event |
+| GET | `/audit/events` | Query audit events with filters and pagination |
+| GET | `/audit/verify` | Verify full audit-chain integrity |
+| POST | `/audit/retention/archive` | Soft-archive events older than the configured retention window |
+| POST | `/audit/events/{sequenceNumber}/redact` | Redact approved payload fields and append a proof event |
+| GET | `/audit/export?actorId=...` | Export matching events for an actor |
+| GET | `/audit/export?resourceId=...` | Export matching events for a resource |
+| GET | `/api/v1/compliance-report` | Generate a read-only, verifiable compliance report |
+
+---
+
+# 19. Data Model
+
+Important `AuditEvent` fields:
+
+```text
 id
 eventType
 actorId
@@ -88,927 +639,243 @@ timestamp
 sequenceNumber
 previousHash
 eventHash
-
-There is no normal PUT or DELETE endpoint for rewriting historical audit records.
-
-2. Tamper-Evident Hash Chain
-
-Every audit event stores:
-
-sequenceNumber
-previousHash
-eventHash
-
-The first event uses the genesis value:
-
-0000000000000000000000000000000000000000000000000000000000000000
-
-That is exactly 64 zero characters.
-
-Later events reference the previous event's hash:
-
-Event 1
-previousHash = 0000...0000
-eventHash    = HASH(Event 1)
-
-        ↓
-
-Event 2
-previousHash = Event 1.eventHash
-eventHash    = HASH(Event 2)
-
-        ↓
-
-Event 3
-previousHash = Event 2.eventHash
-eventHash    = HASH(Event 3)
-
-If stored event data is modified without producing the corresponding valid hash-chain state, verification detects the inconsistency.
-
-3. Event Hash Contract
-
-AuditEventHasher is the source of truth for audit-event hash computation.
-
-The event-hash contract uses:
-
-SHA-256
-
-UTF-8
-
-canonical JSON
-
-timestamp represented as epoch milliseconds
-
-explicit sequenceNumber
-
-previousHash
-
-The hashed fields are:
-
-actorId
-eventType
-payload
-previousHash
-resourceId
-resourceType
-sequenceNumber
-timestamp
-
-Scenario B does not replace this Scenario A event-hash contract.
-
-4. Canonical JSON
-
-Raw JSON text cannot safely be used directly for deterministic hashing because object-key order can differ while meaning remains the same.
-
-For example:
-
-{
-  "a": 1,
-  "b": 2
-}
-
-and:
-
-{
-  "b": 2,
-  "a": 1
-}
-
-are semantically equivalent.
-
-Before hashing:
-
-object keys are recursively sorted,
-
-nested objects are sorted the same way,
-
-array order is preserved,
-
-scalar values are preserved.
-
-Array order is intentionally preserved because ordering may be meaningful.
-
-5. Why sequenceNumber Is Separate from Database id
-
-The database id is a storage identifier.
-
-The explicit sequenceNumber represents the event's position in the audit chain:
-
-1 → 2 → 3 → 4 → ...
-
-This makes verification deterministic and avoids treating a database-generated identifier as the cryptographic chain-ordering contract.
-
-6. Concurrent Writes
-
-The project originally evaluated locking the current chain tail. Testing showed that approach was not sufficient because:
-
-the empty chain has no tail row to lock,
-
-a newly inserted tail can still create a race between concurrent writers.
-
-The final design uses a stable singleton lock row:
-
-audit_chain_lock
----------------
-id = 1
-
-Each writer performs the append operation inside one transaction:
-
-BEGIN TRANSACTION
-
-SELECT singleton lock row FOR UPDATE
-
-read current chain tail
-
-calculate next sequenceNumber
-
-calculate previousHash
-
-calculate eventHash
-
-insert event
-
-COMMIT
-
-This serializes the chain-building critical section and prevents duplicate sequence numbers and competing chain tails.
-
-Startup validation checks that the required lock row exists so the service can fail fast instead of discovering the problem only on the first write.
-
-7. Query API
-
-Endpoint
-
-GET /audit/events
-
-Supported optional filters include:
-
-actorId
-resourceType
-resourceId
-eventType
-from
-to
-
-Filters can be combined.
-
-Example:
-
-GET /audit/events?actorId=user-123&eventType=ACCOUNT_VIEWED
-
-Pagination is supported for large result sets.
-
-Scenario B also adds:
-
-includeArchived
-
-Example:
-
-GET /audit/events?includeArchived=true
-
-Archived events are excluded from normal browsing by default but remain available for chain verification and compliance export.
-
-8. Chain Verification
-
-Endpoint
-
-GET /audit/verify
-
-The verifier loads events in ascending sequenceNumber order and checks:
-
-sequence numbers are contiguous starting at 1,
-
-the first record uses the 64-zero genesis previousHash,
-
-every later record's previousHash matches the previous event's eventHash,
-
-the persisted payload is valid JSON,
-
-the event hash is recomputed through the existing AuditEventHasher,
-
-the recomputed hash matches the stored eventHash.
-
-Verification reports the first detected inconsistency.
-
-Example valid response:
-
-{
-  "valid": true,
-  "firstInconsistentRecord": null,
-  "violationType": null
-}
-
-Example invalid response:
-
-{
-  "valid": false,
-  "firstInconsistentRecord": 4,
-  "violationType": "EVENT_HASH_MISMATCH"
-}
-
-Violation types include:
-
-SEQUENCE_GAP
-INVALID_GENESIS_PREVIOUS_HASH
-PREVIOUS_HASH_MISMATCH
-MALFORMED_PAYLOAD
-EVENT_HASH_MISMATCH
-
-9. Scenario A Tamper-Detection Flow
-
-A typical Scenario A validation flow is:
-
-Create audit events
-       ↓
-Query audit events
-       ↓
-GET /audit/verify
-       ↓
-valid = true
-       ↓
-Modify a stored record directly in the database
-       ↓
-GET /audit/verify
-       ↓
-tampering detected
-
-Tests perform direct persistence-layer modification to simulate tampering. No production mutation endpoint is required for that test.
-
-Scenario B — Compliance Data Lifecycle
-
-Scenario B extends the audit system with:
-
-configurable soft-archive retention,
-
-structured payload redaction,
-
-cryptographic redaction evidence,
-
-redaction-aware chain verification,
-
-verifiable bulk export.
-
-The main challenge is supporting legitimate compliance operations without silently rewriting the history created in Scenario A.
-
-1. Retention Through Soft Archive
-
-Physically deleting an old audit record would create a gap in the chain.
-
-Example:
-
-1 → 2 → 3 → 4 → 5
-
-Deleting event 3 would leave:
-
-1 → 2 → 4 → 5
-
-The verifier would correctly detect a broken sequence.
-
-For that reason, Scenario B uses soft archive instead of physical deletion.
-
-AuditEvent includes lifecycle metadata:
-
 archived
 archivedAt
+```
 
-These fields are deliberately excluded from the Scenario A event-hash contract.
+Scenario A integrity-protected content is separated from Scenario B lifecycle metadata.
 
-Archiving therefore does not change:
+`archived` and `archivedAt` are lifecycle fields and are intentionally not included in the original event hash.
 
-sequenceNumber
-previousHash
-eventHash
-payload
-eventType
-actorId
-resourceType
-resourceId
-timestamp
+---
 
-2. Retention Configuration
+# 20. Running the Application
 
-The retention window is configurable:
+## Prerequisites
 
-audit.retention.days=90
+- Java 17
+- PostgreSQL
+- Git
 
-3. Retention Endpoint
+Maven does not need to be installed globally because the repository includes the Maven Wrapper.
 
-POST /audit/retention/archive
+Configure the PostgreSQL datasource through the application's Spring configuration for your local environment.
 
-The service calculates:
+At minimum, verify your local configuration supplies the appropriate:
 
-cutoff = current server time - retentionDays
+```properties
+spring.datasource.url
+spring.datasource.username
+spring.datasource.password
+```
 
-Eligible events older than the cutoff are marked archived.
+Also configure the retention policy as needed:
 
-Example response:
+```properties
+audit.retention.days=<number-of-days>
+```
 
-{
-  "archivedCount": 12,
-  "cutoff": "2026-06-15T19:32:37Z"
-}
+## Windows
 
-The operation is idempotent: already archived events are not repeatedly processed.
+```powershell
+.\mvnw.cmd spring-boot:run
+```
 
-Archived records remain physically stored and continue to participate in GET /audit/verify.
+## macOS / Linux / Git Bash
 
-4. Structured Redaction
+```bash
+./mvnw spring-boot:run
+```
 
-An audit payload can contain sensitive data:
+Do not commit real database passwords or other secrets to Git.
 
-{
-  "customer": {
-    "name": "Example User",
-    "ssn": "123-45-6789"
-  }
-}
+---
 
-A privacy/compliance request may require removing the sensitive value.
+# 21. Running Tests
 
-Simply changing the payload would normally break the original event hash, because the original payload contributed to that hash.
+## Windows
 
-Recomputing the historical event hash would also be wrong because later events reference it in previousHash.
+```powershell
+.\mvnw.cmd clean test
+```
 
-Scenario B therefore preserves the original event hash and records the authorized redaction as a new append-only audit event.
+## macOS / Linux / Git Bash
 
-5. Redaction Endpoint
+```bash
+./mvnw clean test
+```
 
-POST /audit/events/{sequenceNumber}/redact
+The completed Scenario A/B/C suite currently reports:
 
-Example:
-
-{
-  "actorId": "privacy-officer-123",
-  "paths": [
-    "/customer/ssn"
-  ],
-  "reason": "Customer privacy request"
-}
-
-Paths use JSON Pointer-style addressing.
-
-The targeted value is replaced with:
-
-***REDACTED***
-
-Result:
-
-{
-  "customer": {
-    "name": "Example User",
-    "ssn": "***REDACTED***"
-  }
-}
-
-The original sensitive value is physically absent from the current stored payload afterward.
-
-6. Fields Preserved During Redaction
-
-Redaction does not change the target event's:
-
-sequenceNumber
-previousHash
-eventHash
-timestamp
-actorId
-eventType
-resourceType
-resourceId
-
-Most importantly:
-
-eventHash is NOT recomputed
-
-This preserves the original event's historical cryptographic identity.
-
-7. Redaction Proof Event
-
-Every authorized redaction appends a new normal hash-chained event:
-
-eventType = AUDIT_PAYLOAD_REDACTED
-
-Its payload records evidence such as:
-
-{
-  "targetSequenceNumber": 27,
-  "targetEventHash": "original-event-hash",
-  "redactedPayloadHash": "sha256-of-current-redacted-payload",
-  "paths": [
-    "/customer/ssn"
-  ],
-  "reason": "Customer privacy request",
-  "redactedAt": "2026-09-13T19:32:38Z"
-}
-
-The proof event goes through the normal chain-writing mechanism and therefore receives its own:
-
-sequenceNumber
-previousHash
-eventHash
-timestamp
-
-This makes the redaction itself auditable.
-
-8. Atomic Redaction
-
-The target payload change and proof-event append are performed as one logical transaction:
-
-BEGIN TRANSACTION
-
-Acquire ChainLock
-
-Load target event
-
-Validate requested JSON paths
-
-Apply redaction
-
-Calculate canonical redactedPayloadHash
-
-Persist redacted payload
-
-Append AUDIT_PAYLOAD_REDACTED event
-
-COMMIT
-
-If the operation fails, it should not leave only half of the redaction state committed.
-
-The existing chain-lock design is reused rather than introducing a second concurrency mechanism.
-
-9. Redaction-Aware Verification
-
-Scenario B extends GET /audit/verify.
-
-Ordinary events still require:
-
-recomputed eventHash == stored eventHash
-
-A redacted historical event is different because its current payload is intentionally different from the original payload that produced its stored event hash.
-
-The verifier does not simply ignore the mismatch.
-
-The mismatch is accepted only when a matching valid AUDIT_PAYLOAD_REDACTED proof ties the current redacted representation back to the original event.
-
-The verifier checks evidence including:
-
-proof.targetSequenceNumber == target.sequenceNumber
-
-proof.targetEventHash == target.eventHash
-
-SHA256(canonical current redacted payload)
-    == proof.redactedPayloadHash
-
-The proof event itself must also remain a valid hash-chained audit event.
-
-Without matching proof:
-
-EVENT_HASH_MISMATCH
-
-is reported.
-
-This preserves detection of unauthorized database modification.
-
-10. Example Redaction Flow
-
-Before redaction:
-
-Event 27
-payload = original sensitive JSON
-eventHash = AAA
-
-After controlled redaction:
-
-Event 27
-payload = redacted JSON
-eventHash = AAA
-
-The original event hash remains unchanged.
-
-A later event records the proof:
-
-Event 41
-eventType = AUDIT_PAYLOAD_REDACTED
-targetSequenceNumber = 27
-targetEventHash = AAA
-redactedPayloadHash = BBB
-
-Verification can therefore distinguish an authorized lifecycle operation from unexplained payload tampering.
-
-11. Bulk Export
-
-Endpoint
-
-GET /audit/export
-
-Exactly one filter is accepted:
-
-GET /audit/export?actorId=user-123
-
-or:
-
-GET /audit/export?resourceId=account-456
-
-Providing both filters or neither filter results in a bad request.
-
-The export is not paginated.
-
-Matching archived records are included.
-
-Records are returned deterministically in:
-
-sequenceNumber ASC
-
-12. Export Bundle
-
-The export is a self-contained bundle with metadata such as:
-
-{
-  "exportedAt": "2026-09-13T19:32:38Z",
-  "filter": {
-    "type": "actorId",
-    "value": "user-123"
-  },
-  "hashAlgorithm": "SHA-256",
-  "records": [],
-  "redactionProofs": [],
-  "bundleHash": "..."
-}
-
-Each exported record contains integrity-relevant information including:
-
-sequenceNumber
-eventType
-actorId
-resourceType
-resourceId
-payload
-timestamp
-previousHash
-eventHash
-archived
-archivedAt
-
-If a record has been redacted, only its current redacted payload is exported.
-
-The removed sensitive value is not reintroduced into the export.
-
-Relevant redaction proof information is included.
-
-13. Export Bundle Hash
-
-The bundle has a deterministic SHA-256 hash.
-
-Conceptually:
-
-bundleHash =
-SHA-256(
-  canonical(
-    exportedAt,
-    filter,
-    hashAlgorithm,
-    ordered records,
-    redaction proofs
-  )
-)
-
-bundleHash itself is excluded from the material used to calculate it.
-
-Changing the bundle after export changes the recomputed hash.
-
-Examples include changes to:
-
-actorId
-resourceId
-payload
-filter metadata
-redaction proof data
-
-An ExportBundleVerifier component provides reusable verification logic.
-
-14. Important Export Limitation
-
-Suppose the full chain is:
-
-1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
-
-An export filtered by actor might contain only:
-
-2
-5
-8
-
-The bundle can provide integrity protection for the exported contents after the bundle is produced.
-
-A filtered subset of a simple linear hash chain does not automatically prove that no other matching events existed in the source database.
-
-Proving complete historical membership would require additional evidence such as:
-
-intermediate records,
-
-a stronger authenticated data structure,
-
-or an external trust anchor/checkpoint.
-
-The project documents this limitation instead of overstating the guarantee.
-
-API Summary
-
-Method
-
-Endpoint
-
-Purpose
-
-POST
-
-/audit/events
-
-Append an audit event
-
-GET
-
-/audit/events
-
-Query/filter/paginate audit events
-
-GET
-
-/audit/verify
-
-Verify audit-chain integrity
-
-POST
-
-/audit/retention/archive
-
-Soft-archive events outside the retention window
-
-POST
-
-/audit/events/{sequenceNumber}/redact
-
-Redact structured payload fields with proof
-
-GET
-
-/audit/export?actorId=...
-
-Export matching events for an actor
-
-GET
-
-/audit/export?resourceId=...
-
-Export matching events for a resource
-
-Testing
-
-Testing covers repository, service, controller, concurrency, verification, lifecycle, redaction, and export behavior.
-
-Scenario A Coverage
-
-event creation
-
-request validation
-
-append-only behavior
-
-deterministic SHA-256 hashing
-
-recursive canonical JSON
-
-array-order preservation
-
-genesis hash behavior
-
-sequence-number assignment
-
-previousHash linkage
-
-concurrent writes on an empty chain
-
-concurrent writes on an established chain
-
-startup chain-lock validation
-
-query filters
-
-pagination
-
-valid-chain verification
-
-invalid genesis detection
-
-sequence-gap detection
-
-broken-link detection
-
-payload tampering
-
-eventHash tampering
-
-malformed persisted payload
-
-direct database tampering
-
-Scenario B Retention Coverage
-
-old records archived
-
-recent records stay active
-
-already archived records are not reprocessed
-
-retention window configuration
-
-archived records remain stored
-
-archive metadata does not alter chain hashes
-
-verification remains valid after archival
-
-archived query visibility
-
-Scenario B Redaction Coverage
-
-top-level redaction
-
-nested redaction
-
-original sensitive value removed
-
-unrelated fields preserved
-
-target eventHash preserved
-
-proof event appended
-
-proof event hash-chained
-
-authorized redaction verifies
-
-unauthorized payload modification detected
-
-modification after redaction detected
-
-proof tampering detected
-
-invalid path handling
-
-missing target handling
-
-proof events cannot themselves be redacted
-
-Scenario B Export Coverage
-
-export by actorId
-
-export by resourceId
-
-export-filter validation
-
-deterministic sequence ordering
-
-archived records included
-
-original redacted value not exposed
-
-relevant proof included
-
-valid bundle verification
-
-mutated record detection
-
-mutated payload detection
-
-mutated metadata detection
-
-At the latest reported full validation run:
-
-Tests run: 90
-Failures: 0
-Errors: 0
-Skipped: 0
-
+```text
+116 tests
+0 failures
+0 errors
 BUILD SUCCESS
+```
 
-Database
+Automated tests use H2 so the test suite does not depend on a developer's local PostgreSQL instance.
 
-Production-style configuration uses PostgreSQL.
+Coverage includes event creation and validation, persistence, deterministic hashing, concurrent append safety, chain verification, tamper detection, filtering, pagination, retention, archive/verification compatibility, redaction/proof behavior, export verification, compliance-report verification, controller validation, and full regression coverage.
 
-Tests use H2.
+---
 
-The application is configured with:
+# 22. Testing Strategy
 
-spring.jpa.hibernate.ddl-auto=none
+The project uses focused, incremental tests for each engineering slice.
 
-for production-style operation.
+```text
+Define behavior
+     |
+     v
+Write focused test
+     |
+     v
+Confirm failure / missing behavior
+     |
+     v
+Implement minimum correct solution
+     |
+     v
+Run focused test
+     |
+     v
+Run full regression suite
+     |
+     v
+Review diff
+     |
+     v
+Commit
+```
 
-The project includes SQL initialization related to:
+Integration tests use Spring Boot + MockMvc. Service/repository/hash behavior is covered separately where appropriate.
 
-the chain-lock infrastructure,
+---
 
-Scenario B lifecycle schema additions.
+# 23. Key Design Decisions
 
-Database connection settings use environment-variable overrides, for example:
+- **Server-assigned timestamp:** the service controls the authoritative audit timestamp.
+- **SHA-256 hash chain:** provides deterministic tamper evidence.
+- **Canonical JSON:** avoids false differences caused by JSON object-key ordering.
+- **Explicit sequence number:** audit integrity ordering is not based on database identity alone.
+- **Serialized writes:** the singleton chain-lock row prevents competing concurrent appends.
+- **Soft archive:** keeps history available to verification/compliance while hiding old data from normal browsing.
+- **Proof-based structured redaction:** privacy changes remain explainable and verifiable.
+- **Reuse for Scenario C:** existing query and bundle-verification infrastructure is reused instead of introducing a second integrity model.
 
-spring.datasource.url=${DB_URL:jdbc:postgresql://localhost:5432/auditlog}
-spring.datasource.username=${DB_USERNAME:auditlog}
-spring.datasource.password=${DB_PASSWORD:auditlog}
+---
 
-Security Model
+# 24. Threat Model and Security Limitations
 
-The service is tamper-evident, not absolutely tamper-proof.
+This service is **tamper-evident**, not an absolute guarantee that a fully privileged datastore administrator cannot fabricate an entirely new history.
 
-The SHA-256 chain can expose unexpected modification when stored history no longer agrees with its chain and hashes.
+Important limitations:
 
-However, an attacker with unrestricted administrative access who can rewrite the full database and recompute all dependent hashes may be able to create a new internally consistent history.
+- no authentication or authorization layer is implemented;
+- no API-level RBAC protects compliance, redaction, retention, export, or event creation endpoints;
+- SHA-256 hashes are unkeyed;
+- an attacker with complete database control and the ability to rewrite the entire chain could recompute hashes;
+- no external trusted checkpoint exists;
+- no HMAC, asymmetric digital signature, hardware-backed key, or external transparency log is used;
+- no WORM/immutable object storage is included;
+- generated compliance reports are not persisted;
+- compliance reports are intentionally unpaginated in this prototype, which is a scalability limitation for very large datasets;
+- operational monitoring, rate limiting, and production secret-management integration are outside the prototype scope.
 
-A stronger production design could add:
+Potential production improvements include OAuth2/OIDC, RBAC/ABAC, service identities, HMAC or digital signatures, KMS/HSM-managed keys, immutable storage, external chain checkpoints, streaming/pagination for large reports, rate limiting, observability, and production secret management.
 
-HMAC with a protected key,
+---
 
-digital signatures,
+# 25. AI-Assisted Engineering Approach
 
-external chain-head checkpoints,
+AI was used as an engineering assistant for requirement decomposition, design alternatives, code generation, test generation, debugging, refactoring suggestions, documentation, and review preparation.
 
-WORM/immutable storage,
+AI output was not treated as authoritative.
 
-independent audit anchoring,
+Examples of engineering controls applied during the project include:
 
-stronger separation of administrative duties.
+- rejecting the assumption that an auto-increment ID alone guarantees safe chain ordering;
+- requiring deterministic/canonical JSON rather than relying on arbitrary serialization;
+- reviewing HTTP behavior rather than assuming unsupported methods return a particular status;
+- separating design review from implementation for hashing and integrity logic;
+- keeping Scenario C requirements clarification separate from implementation;
+- using small, reviewable Git commits;
+- running focused tests and the full regression suite before accepting changes.
 
-Likewise, privileged operations such as archive and redaction require strong identity and authorization controls in a real production system. Full identity-platform integration is outside this prototype.
+The engineer remains responsible for final correctness, maintainability, and production-readiness decisions.
 
-Key Engineering Decisions
+---
 
-Use explicit sequenceNumber rather than DB id for chain order.
+# 26. Repository / Development Process
 
-Use a stable singleton lock row rather than an unstable chain-tail lock.
+The project was developed incrementally in Git with meaningful checkpoints across repository setup, requirements analysis, Spring Boot baseline, event write API, tamper-evident hash chain, chain verification, query/lifecycle work, Scenario B functionality, Scenario C verification foundation, Scenario C service, Scenario C API, and documentation.
 
-Use canonical JSON instead of raw JSON text.
+Before every final submission checkpoint, review:
 
-Use epoch milliseconds in the event-hash contract.
+```bash
+git status
+git diff
+git log --oneline
+```
 
-Use 64 zero characters as the genesis previousHash.
+and run:
 
-Reuse AuditEventHasher for write and verification rules.
+```bash
+./mvnw clean test
+```
 
-Soft-archive records instead of deleting chain history.
+The assignment repository must remain private and be shared with the assessment panel according to the assignment instructions.
 
-Preserve original eventHash during authorized redaction.
+---
 
-Represent redaction with an append-only AUDIT_PAYLOAD_REDACTED proof event.
+# 27. Related Documentation
 
-Require proof before accepting a redacted-payload hash mismatch.
+- `ATTESTATION.md` — required candidate attestation
+- `REQUIREMENTS.md` — requirement interpretation and assumptions
+- `SCENARIO_B.md` — detailed Scenario B design/trade-offs
+- `Readme.md` — architecture, APIs, implementation summary, setup, tests, limitations
 
-Use deterministic canonical hashing for export bundles.
+A dedicated `SCENARIO_C.md` can be added if a separate detailed ambiguity/design record is desired; the key Scenario C decisions and implementation behavior are documented above.
 
-Project Status
+---
 
-Scenario A
+# 28. Final Implementation Status
 
-Implemented:
+```text
+Scenario A — COMPLETE
+  Write API                 COMPLETE
+  Append-only API           COMPLETE
+  Query API                 COMPLETE
+  Filtering                 COMPLETE
+  Pagination                COMPLETE
+  SHA-256 hash chain        COMPLETE
+  Concurrent append safety  COMPLETE
+  Chain verification        COMPLETE
+  Tamper detection          COMPLETE
 
-Create
-Query
-Hash Chain
-Concurrency Protection
-Chain Verification
-Tamper Detection
+Scenario B — COMPLETE
+  Retention / archive       COMPLETE
+  Structured redaction      COMPLETE
+  Redaction proof handling  COMPLETE
+  Bulk export               COMPLETE
+  Independent verification  COMPLETE
 
-Scenario B
+Scenario C — COMPLETE
+  Requirement clarification COMPLETE
+  Compliance filter DTOs    COMPLETE
+  Verifiable report support COMPLETE
+  Compliance report service COMPLETE
+  REST endpoint             COMPLETE
+  Time-range validation     COMPLETE
+  Integration tests         COMPLETE
+  README documentation      COMPLETE
 
-Implemented:
+Full regression suite
+  116 tests
+  0 failures
+  0 errors
+  BUILD SUCCESS
+```
 
-Configurable Soft-Archive Retention
-Structured Payload Redaction
-Redaction Proof Events
-Redaction-Aware Chain Verification
-Verifiable actorId/resourceId Export
-Bundle Hash Verification
-
-Scenario C
-
-Not covered by this README yet.
-
-AI-Assisted Engineering Process
-
-The project was developed iteratively, with tests used to validate assumptions instead of treating generated code as automatically correct.
-
-A key example was concurrency control. An initial tail-row locking idea was rejected after real concurrent tests exposed the empty-chain and newly-created-tail race. The implementation was changed to the stable singleton lock-row design.
-
-The same pattern was used throughout the project:
-
-understand requirement
-        ↓
-design small solution
-        ↓
-write/run tests
-        ↓
-observe actual behavior
-        ↓
-correct incorrect assumptions
-        ↓
-rerun full regression suite
-
-This keeps AI assistance subordinate to engineering review and executable evidence.
+The remaining work before submission is final repository review, documentation/attestation verification, a clean-checkout run, secret scan, and live-defense preparation.
